@@ -1,0 +1,152 @@
+# Setting the working directory
+setwd("path/to/your/directory")  # Replace with your actual directory path
+
+# Load libraries
+library(dplyr)
+library(tidyverse)
+library(GEOquery)
+library(readr)
+library(openxlsx)
+library(MetaCycle)
+
+# Read in the FPKM normalized expression data
+dat <- read.csv("path/to/GSE98965_baboon_tissue_expression_FPKM.csv")  # Replace with your actual file path
+
+# Get metadata from GEO
+gse <- getGEO(GEO='GSE98965', GSEMatrix = TRUE)
+
+# Extract the phenodata
+metadata <- pData(gse[[1]])
+
+# Select relevant columns from metadata
+selected_metadata <- metadata %>%
+  select(geo_accession, `tissue:ch1`, `time:ch1`)
+
+# Filter for heart tissue from the metadata
+heart_metadata <- selected_metadata %>%
+  filter(`tissue:ch1` == "Heart")
+
+# Specify genes that code the alpha sub-unit of cardiac ion channel genes of interest
+cardiac_ion_channel_genes <- c("SCN5A", "KCNQ1", "KCNA4", "CACNA1C")
+
+# Filter the transcriptome data for the specified genes
+filtered_transcriptome <- dat %>%
+  filter(Symbol %in% cardiac_ion_channel_genes) %>%
+  select(EnsemblID, Symbol, starts_with("HEA.ZT"))
+
+# Reshape the data to a long format
+filtered_long <- filtered_transcriptome %>%
+  pivot_longer(cols = starts_with("HEA.ZT"), names_to = "time_point", values_to = "expression_value")
+
+# Extract relevant time points from geo_accession for merging
+heart_metadata <- heart_metadata %>%
+  mutate(time_point = paste0("HEA.", `time:ch1`))
+
+# Merge the reshaped data with metadata
+merged_data <- filtered_long %>%
+  left_join(heart_metadata, by = "time_point")
+
+# Calculate mean baseline expression for each gene
+baseline_stats <- merged_data %>%
+  group_by(Symbol) %>%
+  summarize(
+    baseline_expression = mean(expression_value, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Calculate percentage difference from mean baseline for each gene at different time points
+percentage_difference_stats <- merged_data %>%
+  left_join(baseline_stats, by = "Symbol") %>%
+  mutate(percentage_difference = ((expression_value - baseline_expression) / baseline_expression) * 100)
+
+# Combine all statistics for final output
+final_stats <- merged_data %>%
+  left_join(baseline_stats, by = "Symbol") %>%
+  left_join(percentage_difference_stats %>% select(Symbol, time_point, percentage_difference), by = c("Symbol", "time_point")) %>%
+  select(Symbol, time_point, expression_value, baseline_expression, percentage_difference)
+
+# Add a column to calculate the difference between FPKM normalized value and mean baseline expression
+final_stats <- final_stats %>%
+  mutate(difference = expression_value - baseline_expression)
+print("Difference column added:")
+print(head(final_stats))
+
+# Calculate standard deviation of expression across all genes in each ZT
+sd_stats <- final_stats %>%
+  group_by(time_point) %>%
+  summarize(sd_expression_across_genes = sd(expression_value, na.rm = TRUE), .groups = 'drop')
+print("Standard deviation statistics calculated:")
+print(head(sd_stats))
+
+# Merge the standard deviation data back to the main dataframe
+final_stats <- final_stats %>%
+  left_join(sd_stats, by = "time_point")
+print("Merged dataframe:")
+print(head(final_stats))
+
+# Create a new workbook and save the final statistics to an Excel file
+wb_new <- createWorkbook()
+addWorksheet(wb_new, "Updated Statistics")
+writeData(wb_new, "Updated Statistics", final_stats)
+
+# Save the new updated workbook
+updated_file_path <- "path/to/your/output/directory/updated_analysis_of_expression.xlsx"  # Replace with your actual output path
+saveWorkbook(wb_new, updated_file_path, overwrite = TRUE)
+
+#################### MetaCycle analysis to find rhythmic genes ##########################################
+
+# Read in output of the previous analysis
+data_for_metacycle <- read.xlsx(updated_file_path, sheet = "Updated Statistics")
+print("Data read from the updated Excel file:")
+print(head(data_for_metacycle))
+
+# Pivot the data to wide format suitable for MetaCycle
+data_wide <- data_for_metacycle %>%
+  select(Symbol, time_point, expression_value) %>%
+  pivot_wider(names_from = time_point, values_from = expression_value)
+
+# Write the data to CSV for MetaCycle analysis
+meta2d_input_file <- "path/to/your/directory/data_for_meta2d.csv"  # Replace with your actual file path
+write.csv(data_wide, meta2d_input_file, row.names = FALSE, quote = FALSE)
+
+# Create output directory for MetaCycle results
+meta2d_output_dir <- "path/to/your/output/directory/meta_output"  # Replace with your actual output path
+dir.create(meta2d_output_dir, showWarnings = FALSE)
+
+# Define timepoints based on actual timepoint data
+num_columns <- ncol(data_wide)
+print(paste("Number of columns in data_wide:", num_columns))
+
+# The number of timepoints should be one less than the number of columns
+# The first column is the gene identifier
+timepoints_vector <- seq(0, (num_columns - 2) * 2, by = 2)
+print(paste("Number of timepoints:", length(timepoints_vector)))
+
+# Run MetaCycle analysis with correct settings
+meta2d(
+  infile = meta2d_input_file,
+  outdir = meta2d_output_dir,
+  filestyle = "csv",
+  timepoints = timepoints_vector,
+  cycMethod = "JTK",
+  minper = 20,  # Minimum period length
+  maxper = 28,  # Maximum period length
+  outputFile = TRUE,
+  outIntegration = "both",
+  adjustPhase = "predictedPer"
+)
+
+# Check if the integrated results file exists
+results_path <- file.path(meta2d_output_dir, "meta2d_data_for_meta2d.csv")
+if (file.exists(results_path)) {
+  # Load the results
+  results <- read.csv(results_path)
+  
+  # Add MetaCycle results to the new Excel file
+  addWorksheet(wb_new, "MetaCycle Results")
+  writeData(wb_new, "MetaCycle Results", results)
+  
+  # Save the updated workbook with MetaCycle results
+  saveWorkbook(wb_new, updated_file_path, overwrite = TRUE)
+}
+
